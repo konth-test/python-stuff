@@ -22,5 +22,3 @@ def publish(country, year, db_path):
     )
 
     mq_channel.close()
-
-publish("Brazil", 2009, "C:/Users/konth/Desktop/exam/db/chinook.db")
