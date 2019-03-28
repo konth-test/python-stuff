@@ -4,18 +4,18 @@ import json
 import xml.etree.ElementTree as xml
 import os
 import pika
-import re
 
 # config
 QUEUE_NAME =            "test"
 QUEUE_URL =             "localhost"
 
 OUTPUT_DIR =            "output"
-OUTPUT_DIR_COUNTRIES =  os.path.join(OUTPUT_DIR, "countries")
-NUM_INV_FILE =          os.path.join(OUTPUT_DIR, "num_inv.csv")
-NUM_ITEMS_FILE =        os.path.join(OUTPUT_DIR, "num_items.csv")
-ALBUMS_FILE =           os.path.join(OUTPUT_DIR_COUNTRIES, "{0}_albums.json")
-BEST_SELLING_FILE =     os.path.join(OUTPUT_DIR_COUNTRIES, "{0}_best_selling_{1}_and_up.xml")
+OUTPUT_DIR_COUNTRIES =      os.path.join(OUTPUT_DIR, "countries")
+OUTPUT_DIR_BEST_SELLING =   os.path.join(OUTPUT_DIR, "best_selling")
+NUM_INV_FILE =              os.path.join(OUTPUT_DIR, "num_inv.csv")
+NUM_ITEMS_FILE =            os.path.join(OUTPUT_DIR, "num_items.csv")
+ALBUMS_FILE =               os.path.join(OUTPUT_DIR_COUNTRIES, "{0}_albums.json")
+BEST_SELLING_FILE =         os.path.join(OUTPUT_DIR_BEST_SELLING, "{0}_best_selling_{1}_and_up.xml")
 
 NUM_ITEMS_CSV_COLUMNS = ["Country", "Items amount"]
 NUM_INV_CSV_COLUMNS = ["Country", "Invoices amount"]
@@ -65,23 +65,14 @@ def init_mq():
     print("Listening to queue...")
     mq_channel.start_consuming()
 
-
-def init_csv_file(file_path, columns):
-    try:
-        fh = open(file_path, 'r')
-        fh.close()
-    except FileNotFoundError:
-        with open(file_path, mode='w+', newline='') as file:
-            writer = csv.writer(file)
-            writer.writerow(columns)
+def create_dir_if_not_exists(path):
+    if not os.path.exists(path):
+        os.makedirs(path)
 
 
-def init_all_files():
-    if not os.path.exists(OUTPUT_DIR_COUNTRIES):
-        os.makedirs(OUTPUT_DIR_COUNTRIES)
-
-    init_csv_file(NUM_INV_FILE, NUM_INV_CSV_COLUMNS)
-    init_csv_file(NUM_ITEMS_FILE, NUM_ITEMS_CSV_COLUMNS)
+def init_dirs():
+    create_dir_if_not_exists(OUTPUT_DIR_COUNTRIES)
+    create_dir_if_not_exists(OUTPUT_DIR_BEST_SELLING)
 
 
 def db_is_valid(db_path):
@@ -125,46 +116,37 @@ def db_create_tables():
                              )""")
 
 
-def db_country_exists(country):
-    data = db_conn.execute("SELECT * FROM invoices WHERE BillingCountry = ? LIMIT 1", [country])
-
-    return not (data.fetchone() is None)
-
-
-def db_records_exists_for_year(year):
-    year = str(year) + "-01-01"
-    data = db_conn.execute("SELECT * FROM invoices WHERE InvoiceDate >= ? LIMIT 1", [year])
-
-    return not (data.fetchone() is None)
-
-
-def db_read_num_invoices(country):
-    data = db_conn.execute("SELECT COUNT(*) FROM invoices WHERE BillingCountry = ?", [country])
-    return data.fetchone()[0]
-
-
-def db_read_num_items(country):
+def db_read_num_invoices():
     data = db_conn.execute("""  SELECT
+                                    BillingCountry,
+                                    COUNT(*)
+                                FROM invoices
+                                GROUP BY BillingCountry""")
+    return data.fetchall()
+
+
+def db_read_num_items():
+    data = db_conn.execute("""  SELECT
+                                    BillingCountry,
                                     COUNT(*)
                                 FROM invoice_items
                                     LEFT JOIN invoices
                                         ON invoice_items.InvoiceId = invoices.InvoiceId
-                                WHERE invoices.BillingCountry = ?""", [country])
-    return data.fetchone()[0]
+                                GROUP BY BillingCountry""")
+    return data.fetchall()
 
 
-def db_read_purchased_albums(country):
+def db_read_purchased_albums():
     data = db_conn.execute("""  SELECT
-                                    albums.Title
-                                FROM albums
-                                    LEFT JOIN tracks
-                                        ON tracks.AlbumId = albums.AlbumId
+                                    BillingCountry, albums.Title
+                                FROM invoices
                                     LEFT JOIN invoice_items
-                                        ON invoice_items.TrackId = tracks.TrackId
-                                    LEFT JOIN invoices
                                         ON invoice_items.InvoiceId = invoices.InvoiceId
-                                WHERE invoices.BillingCountry = ?
-                                GROUP BY ( albums.Title )""", [country])
+                                    LEFT JOIN tracks
+                                        ON tracks.TrackId = invoice_items.TrackId
+                                    LEFT JOIN albums
+                                        ON albums.AlbumId = tracks.AlbumId
+                                GROUP BY BillingCountry, Title""")
     return data.fetchall()
 
 
@@ -182,8 +164,7 @@ def db_read_best_selling_track(country, year):
                                     LEFT JOIN tracks
                                         ON tracks.TrackId = invoice_items.TrackId
                                     LEFT JOIN genres
-                                        ON
-                                        genres.GenreId = tracks.GenreId
+                                        ON genres.GenreId = tracks.GenreId
                                 WHERE
                                     invoices.BillingCountry = ?
                                     AND invoices.InvoiceDate >= ?
@@ -195,35 +176,24 @@ def db_read_best_selling_track(country, year):
     return data.fetchone()
 
 
-def output_to_csv(file_path, data):
-    new_file = None
-    mode = 'a'
-
-    with open(file_path, mode='r', newline='') as file:
-        file_str = file.read()
-        res = re.search(data[0] + ",.*", file_str)
-        if res:
-            start = res.span()[0]
-            end = res.span()[1]
-            new_file = file_str[:start] + data[0] + "," + str(data[1]) + file_str[end:]
-            mode = 'w+'
-
-    with open(file_path, mode=mode, newline='') as file:
-        if new_file:
-            file.write(new_file)
-        else:
+def output_to_csv(file_path, data, columns):
+    with open(file_path, mode='w+', newline='') as file:
             writer = csv.writer(file, delimiter=',', quotechar='"', quoting=csv.QUOTE_MINIMAL)
-            writer.writerow(data)
+            writer.writerow(columns)
+            for row in data:
+                writer.writerow(row)
 
 
-def output_to_json(country, data):
-    file_path = ALBUMS_FILE.format(country)
+def output_to_json(data):
+    for country in data:
+        c_data = data[country]
+        file_path = ALBUMS_FILE.format(country)
 
-    with open(file_path, mode='w+') as file:
-        json.dump(data, file, ensure_ascii=False)
+        with open(file_path, mode='w+') as file:
+            json.dump(c_data, file, ensure_ascii=False)
 
 
-def parse_album_data(data):
+def parse_best_selling_data(data):
     new_data = {
         "name": data[0],
         "country": data[1],
@@ -233,6 +203,16 @@ def parse_album_data(data):
 
     return new_data
 
+def parse_album_data(data):
+    new_data = {}
+
+    for country, album in data:
+        if country in new_data:
+            new_data[country].append(album)
+        else:
+            new_data[country] = []
+
+    return new_data
 
 def output_to_xml(data, query_year):
     track_xml_data = xml.Element('Track')
@@ -248,10 +228,12 @@ def output_to_xml(data, query_year):
     tree.write(file_name)
 
 
-def output_to_db(country, num_inv, num_items, album_data):
-    db_cursor.execute("REPLACE INTO num_invoices VALUES( ?, ? )", [country, num_inv])
+def output_to_db(invoice_data, items_data, album_data):
+    for country, n in invoice_data:
+        db_cursor.execute("REPLACE INTO num_invoices VALUES( ?, ? )", [country, n])
 
-    db_cursor.execute("REPLACE INTO num_items VALUES( ?, ? )", [country, num_items])
+    for country, n in items_data:
+        db_cursor.execute("REPLACE INTO num_items VALUES( ?, ? )", [country, n])
 
     if album_data:
         db_cursor.execute("REPLACE INTO best_selling VALUES( ?, ?, ?, ? )",
@@ -266,33 +248,26 @@ def output_to_db(country, num_inv, num_items, album_data):
 
 
 def process_message(country, year):
-    if not db_country_exists(country):
-        print("Invalid country name:", country)
-        return
+    invoice_data = db_read_num_invoices()
+    output_to_csv(NUM_INV_FILE, invoice_data, NUM_INV_CSV_COLUMNS)
 
-    if not db_records_exists_for_year(year):
-        print("No records for or after year:", year)
-        return
+    item_data = db_read_num_items()
+    output_to_csv(NUM_ITEMS_FILE, item_data, NUM_ITEMS_CSV_COLUMNS)
 
-    num_inv = db_read_num_invoices(country)
-    output_to_csv(NUM_INV_FILE, [country, num_inv])
-
-    num_items = db_read_num_items(country)
-    output_to_csv(NUM_ITEMS_FILE, [country, num_items])
-
-    albums = db_read_purchased_albums(country)
-    output_to_json(country, albums)
+    album_data = parse_album_data( db_read_purchased_albums() )
+    output_to_json(album_data)
 
     best_selling = db_read_best_selling_track(country, year)
     if best_selling: # not always best selling will be found with Genre rock
-        best_selling = parse_album_data(best_selling)
+        best_selling = parse_best_selling_data(best_selling)
         output_to_xml( best_selling, year)
+    else:
+        print("No records found for best selling")
 
-    output_to_db(country, num_inv, num_items, best_selling)
-
+    output_to_db(invoice_data, item_data, best_selling)
 
 def initialize_module():
-    init_all_files()
+    init_dirs()
     init_mq()
 
 
