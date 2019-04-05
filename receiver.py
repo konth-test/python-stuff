@@ -4,7 +4,7 @@ import json
 import xml.etree.ElementTree as xml
 import os
 import pika
-
+#
 # config
 QUEUE_NAME =            "test"
 QUEUE_URL =             "localhost"
